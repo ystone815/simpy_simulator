@@ -1,5 +1,6 @@
-
 import simpy
+from base.packet import Packet
+from components.sram import SramSlave # New import
 
 class NVMeSlaveDevice:
     """
@@ -16,78 +17,126 @@ class NVMeSlaveDevice:
         self.processing_latency_ns = processing_latency_ns
         
         self.total_size_bytes = size_in_blocks * block_size_bytes
-        self.memory = bytearray(self.total_size_bytes) # Internal simulated NAND/DRAM
+        
+        # Internal SRAM channels
+        self.sram_req_channel = simpy.Store(env)
+        self.sram_resp_channel = simpy.Store(env)
+
+        # Instantiate internal SRAM Slave
+        self.internal_sram = SramSlave(
+            env=env,
+            size_in_bytes=self.total_size_bytes,
+            in_port=self.sram_req_channel,
+            out_port=self.sram_resp_channel,
+            access_latency_ns=1 # Assuming fast internal SRAM access
+        )
         
         self.action = env.process(self.run())
-        print(f"[{self.env.now}] NVMeSlaveDevice: Initialized with {self.size_in_blocks} blocks ({self.total_size_bytes / (1024*1024):.2f} MB).")
+        print(f"[{self.env.now}] NVMeSlaveDevice: Initialized with {self.size_in_blocks} blocks ({self.total_size_bytes / (1024*1024):.2f} MB) using internal SRAM.")
 
     def run(self):
         while True:
-            # Commands are expected to come from the SoCBus, which prepends master_idx
-            master_idx, command = yield self.in_port.get()
+            master_idx, request_packet = yield self.in_port.get()
             
-            cmd_id, cmd_type, lba, num_blocks, data_payload = self._parse_command(command)
+            cmd_id = request_packet.id
+            cmd_type = request_packet.type
+            lba = request_packet.address
+            num_blocks = request_packet.size
+            data_payload = request_packet.data
             
-            print(f"[{self.env.now}] NVMeSlaveDevice: Received command {cmd_type} (ID: {cmd_id}) from Master {master_idx} for LBA {lba}, {num_blocks} blocks.")
+            print(f"[{self.env.now}] NVMeSlaveDevice: Received {cmd_type} command (ID: {cmd_id}) from Master {master_idx} for LBA {lba}, {num_blocks} blocks.")
             
-            # Simulate processing delay
+            # Simulate NVMe controller processing delay (before accessing SRAM)
             yield self.env.timeout(self.processing_latency_ns)
             
             status = 'SUCCESS'
             bytes_transferred = 0
             read_data_payload = None
+            error_message = None
             
             try:
                 if cmd_type == 'write':
-                    start_byte = lba * self.block_size_bytes
-                    end_byte = start_byte + (num_blocks * self.block_size_bytes)
+                    sram_addr = lba * self.block_size_bytes
+                    sram_size = num_blocks * self.block_size_bytes
                     
-                    if end_byte > self.total_size_bytes or start_byte < 0:
-                        raise IndexError("Write address out of bounds")
-                    if len(data_payload) != (num_blocks * self.block_size_bytes):
+                    if sram_addr + sram_size > self.total_size_bytes or sram_addr < 0:
+                        raise IndexError("Write address out of bounds for internal SRAM")
+                    if len(data_payload) != sram_size:
                         raise ValueError("Data payload size mismatch for write command")
                         
-                    self.memory[start_byte:end_byte] = data_payload
-                    bytes_transferred = len(data_payload)
-                    print(f"[{self.env.now}] NVMeSlaveDevice: Wrote {bytes_transferred} bytes to LBA {lba}.")
+                    # Create SRAM write packet
+                    sram_write_packet = Packet(
+                        id=cmd_id, # Use same ID for correlation
+                        type='write',
+                        source_id=f"NVMeSlave_{self.env.now}",
+                        destination_id="InternalSRAM",
+                        address=sram_addr,
+                        size=sram_size,
+                        data=data_payload
+                    )
+                    yield self.sram_req_channel.put((0, sram_write_packet)) # 0 is dummy master_idx for internal SRAM
+                    sram_response = yield self.sram_resp_channel.get()
                     
-                elif cmd_type == 'read':
-                    start_byte = lba * self.block_size_bytes
-                    end_byte = start_byte + (num_blocks * self.block_size_bytes)
-                    
-                    if end_byte > self.total_size_bytes or start_byte < 0:
-                        raise IndexError("Read address out of bounds")
+                    if sram_response.status == 'OK':
+                        bytes_transferred = len(data_payload)
+                        print(f"[{self.env.now}] NVMeSlaveDevice: Wrote {bytes_transferred} bytes to LBA {lba} via internal SRAM.")
+                    else:
+                        status = 'ERROR'
+                        error_message = f"Internal SRAM write error: {sram_response.error_message}"
                         
-                    read_data_payload = self.memory[start_byte:end_byte]
-                    bytes_transferred = len(read_data_payload)
-                    print(f"[{self.env.now}] NVMeSlaveDevice: Read {bytes_transferred} bytes from LBA {lba}.")
+                elif cmd_type == 'read':
+                    sram_addr = lba * self.block_size_bytes
+                    sram_size = num_blocks * self.block_size_bytes
                     
+                    if sram_addr + sram_size > self.total_size_bytes or sram_addr < 0:
+                        raise IndexError("Read address out of bounds for internal SRAM")
+                        
+                    # Create SRAM read packet
+                    sram_read_packet = Packet(
+                        id=cmd_id,
+                        type='read',
+                        source_id=f"NVMeSlave_{self.env.now}",
+                        destination_id="InternalSRAM",
+                        address=sram_addr,
+                        size=sram_size
+                    )
+                    yield self.sram_req_channel.put((0, sram_read_packet)) # 0 is dummy master_idx for internal SRAM
+                    sram_response = yield self.sram_resp_channel.get()
+                    
+                    if sram_response.status == 'OK':
+                        read_data_payload = sram_response.data
+                        bytes_transferred = len(read_data_payload)
+                        print(f"[{self.env.now}] NVMeSlaveDevice: Read {bytes_transferred} bytes from LBA {lba} via internal SRAM.")
+                    else:
+                        status = 'ERROR'
+                        error_message = f"Internal SRAM read error: {sram_response.error_message}"
+                        
                 elif cmd_type == 'identify':
-                    # Simplified identify data
                     read_data_payload = b'NVMe_Controller_ID_Data'
                     bytes_transferred = len(read_data_payload)
                     print(f"[{self.env.now}] NVMeSlaveDevice: Processed Identify command.")
 
                 else:
                     status = 'ERROR'
-                    print(f"[{self.env.now}] NVMeSlaveDevice: Unsupported command type: {cmd_type}")
+                    error_message = f"Unsupported command type: {cmd_type}"
+                    print(f"[{self.env.now}] NVMeSlaveDevice: {error_message}")
 
             except (IndexError, ValueError, TypeError) as e:
                 status = 'ERROR'
-                print(f"[{self.env.now}] NVMeSlaveDevice Error: {e}")
+                error_message = str(e)
+                print(f"[{self.env.now}] NVMeSlaveDevice Error: {error_message}")
             
-            # Create completion entry
-            completion = (cmd_id, status, bytes_transferred, read_data_payload)
+            # Create completion Packet
+            completion_packet = Packet(
+                id=cmd_id,
+                type='response',
+                source_id=f"NVMeSlave_{self.env.now}",
+                destination_id=request_packet.source_id,
+                status=status,
+                bytes_transferred=bytes_transferred,
+                data=read_data_payload,
+                error_message=error_message
+            )
             
-            # Send completion back to the master via the bus
-            yield self.out_port.put((master_idx, completion))
+            yield self.out_port.put((master_idx, completion_packet)) # Pass the Packet object
             print(f"[{self.env.now}] NVMeSlaveDevice: Sent completion for command ID {cmd_id} with status {status}.")
-
-    def _parse_command(self, command):
-        # Helper to parse the command tuple with default values
-        cmd_id = command[0] if len(command) > 0 else None
-        cmd_type = command[1] if len(command) > 1 else None
-        lba = command[2] if len(command) > 2 else 0
-        num_blocks = command[3] if len(command) > 3 else 0
-        data_payload = command[4] if len(command) > 4 else b''
-        return cmd_id, cmd_type, lba, num_blocks, data_payload

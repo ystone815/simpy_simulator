@@ -1,5 +1,5 @@
-
 import simpy
+from .packet import Packet # New import
 
 class DelayLine:
     def __init__(self, env, in_port, out_port, delay):
@@ -11,9 +11,9 @@ class DelayLine:
 
     def run(self):
         while True:
-            item = yield self.in_port.get()
+            packet = yield self.in_port.get() # Expecting a Packet object
             yield self.env.timeout(self.delay)
-            yield self.out_port.put(item)
+            yield self.out_port.put(packet) # Pass the Packet object
 
 class DelayLineUtil:
     def __init__(self, env, in_port, out_port, data_path_width_byte, clock_freq_mhz, utilization=1.0):
@@ -37,14 +37,10 @@ class DelayLineUtil:
 
     def run(self):
         while True:
-            item = yield self.in_port.get()
+            packet = yield self.in_port.get() # Expecting a Packet object
             
-            if isinstance(item, (list, tuple)) and len(item) == 2:
-                item_data, item_size = item
-            else:
-                item_data = item
-                item_size = 1
-
+            # Use packet.size for delay calculation
+            item_size = packet.size if packet.size is not None else 1 # Default to 1 if size is not set
             delay = self._get_delay_ns(item_size)
             
             with self.resource.request() as req:
@@ -55,8 +51,8 @@ class DelayLineUtil:
                 self.busy_time += (end_wait - self.last_event_time) * (1 if self.resource.count > 0 else 0)
                 
                 yield self.env.timeout(delay)
-                yield self.out_port.put(item_data)
-
+                yield self.out_port.put(packet) # Pass the Packet object
+                
                 self.last_event_time = self.env.now
 
     def _get_delay_ns(self, item_size_in_bytes):

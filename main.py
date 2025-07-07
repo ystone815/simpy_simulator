@@ -3,8 +3,10 @@ from components.cpu import Cpu
 from components.memory import Memory
 from components.bus import SoCBus
 from components.uart import Uart
-from components.nvme_slave import NVMeSlaveDevice # New import
+from components.nvme_slave import NVMeSlaveDevice
+from components.nvme_host import NVMeHost
 from base.delay import DelayLine, DelayLineUtil
+from base.packet import Packet # New import
 
 # 1. Setup Simulation Environment
 env = simpy.Environment()
@@ -16,7 +18,7 @@ env = simpy.Environment()
 cpu_req_bus_channel = simpy.Store(env)
 bus_resp_cpu_channel = simpy.Store(env)
 
-# NVMe Host Queue Manager <-> Bus Channels (Master 1)
+# NVMe Host <-> Bus Channels (Master 1)
 nvme_host_req_bus_channel = simpy.Store(env)
 bus_resp_nvme_host_channel = simpy.Store(env)
 
@@ -41,6 +43,13 @@ crypto_out_channel = simpy.Store(env)
 # Master components
 cpu = Cpu(env, req_port=cpu_req_bus_channel, resp_port=bus_resp_cpu_channel)
 
+# NVMe Host (Master 1)
+# Note: NVMe Slave is Slave 2 in the soc_bus slave_req_ports list (0: Memory, 1: UART, 2: NVMe)
+nvme_host = NVMeHost(env, 
+                     req_port=nvme_host_req_bus_channel, 
+                     resp_port=bus_resp_nvme_host_channel, 
+                     nvme_slave_idx=2) 
+
 # Slave components
 memory = Memory(env, size_in_bytes=1024, 
                 in_port=bus_req_memory_channel, out_port=memory_resp_bus_channel,
@@ -51,9 +60,9 @@ uart = Uart(env, tx_port=bus_req_uart_channel, rx_port=uart_resp_bus_channel)
 nvme_slave = NVMeSlaveDevice(env, 
                              in_port=bus_req_nvme_channel, 
                              out_port=nvme_resp_bus_channel,
-                             size_in_blocks=256, # 256 blocks * 4KB/block = 1MB
-                             block_size_bytes=4096,
-                             processing_latency_ns=500) # Simulate some latency
+                             # size_in_blocks=256, # Removed
+                             # block_size_bytes=4096, # Removed
+                             processing_latency_ns=500)
 
 # Data Path Components (e.g., Crypto Engine)
 crypto_engine = DelayLineUtil(env, 
@@ -65,72 +74,50 @@ crypto_engine = DelayLineUtil(env,
 
 # SoC Bus - connects masters to slaves
 soc_bus = SoCBus(env,
-                 master_req_ports=[cpu_req_bus_channel, nvme_host_req_bus_channel], # Added NVMe Host as a master
-                 master_resp_ports=[bus_resp_cpu_channel, bus_resp_nvme_host_channel], # Added NVMe Host response
-                 slave_req_ports=[bus_req_memory_channel, bus_req_uart_channel, bus_req_nvme_channel], # Added NVMe Slave
-                 slave_resp_ports=[memory_resp_bus_channel, uart_resp_bus_channel, nvme_resp_bus_channel]) # Added NVMe Slave response
+                 master_req_ports=[cpu_req_bus_channel, nvme_host_req_bus_channel], 
+                 master_resp_ports=[bus_resp_cpu_channel, bus_resp_nvme_host_channel], 
+                 slave_req_ports=[bus_req_memory_channel, bus_req_uart_channel, bus_req_nvme_channel], 
+                 slave_resp_ports=[memory_resp_bus_channel, uart_resp_bus_channel, nvme_resp_bus_channel])
 
 # 4. Define Test Processes
 def crypto_test(env, crypto_engine_in, crypto_engine_out):
     yield env.timeout(10)
-    print(f"[{env.now}] Test: Sending 32-byte data to crypto engine.")
-    yield crypto_engine_in.put(("data_block_1", 32))
-    processed_data = yield crypto_engine_out.get()
-    print(f"[{env.now}] Test: Received processed data: {processed_data}")
+    
+    # Send 32-byte data
+    packet_id = 100
+    data_size = 32
+    crypto_packet_1 = Packet(
+        id=packet_id,
+        type='data',
+        source_id='CryptoTest',
+        destination_id='CryptoEngine',
+        size=data_size,
+        data=b'\xAA' * data_size,
+        timestamp=env.now
+    )
+    print(f"[{env.now}] Test: Sending {data_size}-byte data to crypto engine (ID: {packet_id}).")
+    yield crypto_engine_in.put(crypto_packet_1)
+    processed_packet_1 = yield crypto_engine_out.get()
+    print(f"[{env.now}] Test: Received processed data for ID {processed_packet_1.id}: {processed_packet_1.data[:10]}...")
     
     yield env.timeout(5)
-    print(f"[{env.now}] Test: Sending 128-byte data to crypto engine.")
-    yield crypto_engine_in.put(("data_block_2", 128))
-    processed_data = yield crypto_engine_out.get()
-    print(f"[{env.now}] Test: Received processed data: {processed_data}")
-
-def nvme_traffic_generator(env, req_port, resp_port, nvme_slave_idx):
-    yield env.timeout(20) # Wait a bit for CPU to do its thing
-    print(f"[{env.now}] NVMe Host: Starting traffic generation.")
-
-    # Command 1: Identify (cmd_id, cmd_type, lba, num_blocks, data_payload)
-    cmd_id = 1
-    nvme_cmd = (cmd_id, 'identify', 0, 0, b'')
-    print(f"[{env.now}] NVMe Host: Sending Identify command (ID: {cmd_id}).")
-    yield req_port.put((nvme_slave_idx, nvme_cmd)) # (target_slave_idx, actual_command)
-    response = yield resp_port.get()
-    print(f"[{env.now}] NVMe Host: Received response for ID {cmd_id}: {response}")
-    assert response[0] == cmd_id and response[1] == 'SUCCESS'
-
-    yield env.timeout(50)
-
-    # Command 2: Write 1 block to LBA 0
-    cmd_id = 2
-    write_data = b'\xAA' * nvme_slave.block_size_bytes # Fill with AA
-    nvme_cmd = (cmd_id, 'write', 0, 1, write_data)
-    print(f"[{env.now}] NVMe Host: Sending Write command (ID: {cmd_id}) to LBA 0.")
-    yield req_port.put((nvme_slave_idx, nvme_cmd))
-    response = yield resp_port.get()
-    print(f"[{env.now}] NVMe Host: Received response for ID {cmd_id}: {response}")
-    assert response[0] == cmd_id and response[1] == 'SUCCESS'
-
-    yield env.timeout(50)
-
-    # Command 3: Read 1 block from LBA 0
-    cmd_id = 3
-    nvme_cmd = (cmd_id, 'read', 0, 1, b'')
-    print(f"[{env.now}] NVMe Host: Sending Read command (ID: {cmd_id}) from LBA 0.")
-    yield req_port.put((nvme_slave_idx, nvme_cmd))
-    response = yield resp_port.get()
-    print(f"[{env.now}] NVMe Host: Received response for ID {cmd_id}: {response}")
-    assert response[0] == cmd_id and response[1] == 'SUCCESS' and response[3] == write_data
-
-    yield env.timeout(50)
-
-    # Command 4: Write 2 blocks to LBA 10 (out of bounds for 256 blocks)
-    cmd_id = 4
-    write_data_large = b'\xBB' * (2 * nvme_slave.block_size_bytes)
-    nvme_cmd = (cmd_id, 'write', 255, 2, write_data_large) # LBA 255 + 2 blocks will be out of bounds
-    print(f"[{env.now}] NVMe Host: Sending Write command (ID: {cmd_id}) to LBA 255 (out of bounds test).")
-    yield req_port.put((nvme_slave_idx, nvme_cmd))
-    response = yield resp_port.get()
-    print(f"[{env.now}] NVMe Host: Received response for ID {cmd_id}: {response}")
-    assert response[0] == cmd_id and response[1] == 'ERROR'
+    
+    # Send 128-byte data
+    packet_id = 101
+    data_size = 128
+    crypto_packet_2 = Packet(
+        id=packet_id,
+        type='data',
+        source_id='CryptoTest',
+        destination_id='CryptoEngine',
+        size=data_size,
+        data=b'\xBB' * data_size,
+        timestamp=env.now
+    )
+    print(f"[{env.now}] Test: Sending {data_size}-byte data to crypto engine (ID: {packet_id}).")
+    yield crypto_engine_in.put(crypto_packet_2)
+    processed_packet_2 = yield crypto_engine_out.get()
+    print(f"[{env.now}] Test: Received processed data for ID {processed_packet_2.id}: {processed_packet_2.data[:10]}...")
 
 
 # 5. Run Simulation
@@ -138,8 +125,6 @@ print("--- SoC Simulation Started ---")
 
 # Start test processes
 env.process(crypto_test(env, crypto_in_channel, crypto_out_channel))
-# Note: NVMe Slave is Slave 2 in the soc_bus slave_req_ports list (0: Memory, 1: UART, 2: NVMe)
-env.process(nvme_traffic_generator(env, nvme_host_req_bus_channel, bus_resp_nvme_host_channel, nvme_slave_idx=2))
 
 env.run(until=1000) # Run for a longer time to see more interactions
 print("--- SoC Simulation Finished ---")

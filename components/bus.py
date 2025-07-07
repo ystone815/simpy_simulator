@@ -1,4 +1,5 @@
 import simpy
+from base.packet import Packet # New import
 
 class SoCBus:
     def __init__(self, env, master_req_ports, master_resp_ports, slave_req_ports, slave_resp_ports):
@@ -24,60 +25,67 @@ class SoCBus:
             yield self.env.timeout(1000) # Keep the bus process alive
 
     def _handle_master_requests(self):
-        # Use simpy.AnyOf to listen to all master request ports
         while True:
             get_events = [port.get() for port in self.master_req_ports]
             result = yield self.env.any_of(get_events)
             
-            # Find which master sent the request
             master_idx = -1
-            request = None
+            request_tuple = None # This will be (slave_idx, Packet)
             for i, port in enumerate(self.master_req_ports):
-                if port.get() in result: # Check if this port's get event was triggered
+                if port.get() in result:
                     master_idx = i
-                    request = result[port.get()]
+                    request_tuple = result[port.get()]
                     break
             
-            if request:
-                # Request format: (slave_idx, original_request_tuple)
-                # The first element of the request is assumed to be the target slave index
-                slave_idx, original_request = request
+            if request_tuple:
+                slave_idx, request_packet = request_tuple # Unpack the tuple
+                
+                if not isinstance(request_packet, Packet):
+                    print(f"[{self.env.now}] SoCBus Error: Received non-Packet object from Master {master_idx}: {request_packet}")
+                    # Send error back to master
+                    error_packet = Packet(id=-1, type='error', source_id='SoCBus', destination_id=f"Master_{master_idx}", error_message="Invalid request format: Not a Packet object")
+                    yield self.master_resp_ports[master_idx].put(error_packet)
+                    continue
+
+                print(f"[{self.env.now}] SoCBus: Routing {request_packet.type} packet (ID: {request_packet.id}) from Master {master_idx} to Slave {slave_idx}.")
                 
                 if 0 <= slave_idx < len(self.slave_req_ports):
-                    print(f"[{self.env.now}] SoCBus: Routing request from Master {master_idx} to Slave {slave_idx}: {original_request}")
                     # Prepend master_idx to the request so slave knows where to send response
-                    yield self.slave_req_ports[slave_idx].put((master_idx, original_request))
+                    yield self.slave_req_ports[slave_idx].put((master_idx, request_packet))
                 else:
-                    print(f"[{self.env.now}] SoCBus Error: Invalid slave index {slave_idx} from Master {master_idx}")
+                    print(f"[{self.env.now}] SoCBus Error: Invalid slave index {slave_idx} from Master {master_idx} for packet ID {request_packet.id}.")
                     # Send error back to master
-                    yield self.master_resp_ports[master_idx].put(('ERROR', 'Invalid Slave Index'))
+                    error_packet = Packet(id=request_packet.id, type='response', source_id='SoCBus', destination_id=request_packet.source_id, status='ERROR', error_message="Invalid Slave Index")
+                    yield self.master_resp_ports[master_idx].put(error_packet)
             else:
                 print(f"[{self.env.now}] SoCBus Error: Could not identify requesting master.")
 
     def _handle_slave_responses(self):
-        # Use simpy.AnyOf to listen to all slave response ports
         while True:
             get_events = [port.get() for port in self.slave_resp_ports]
             result = yield self.env.any_of(get_events)
             
-            # Find which slave sent the response
             slave_idx = -1
-            response = None
+            response_tuple = None # This will be (master_idx, Packet)
             for i, port in enumerate(self.slave_resp_ports):
                 if port.get() in result:
                     slave_idx = i
-                    response = result[port.get()]
+                    response_tuple = result[port.get()]
                     break
             
-            if response:
-                # Response format: (master_idx, original_response_tuple)
-                # The first element of the response is assumed to be the target master index
-                master_idx, original_response = response
+            if response_tuple:
+                master_idx, response_packet = response_tuple # Unpack the tuple
+                
+                if not isinstance(response_packet, Packet):
+                    print(f"[{self.env.now}] SoCBus Error: Received non-Packet object from Slave {slave_idx}: {response_packet}")
+                    # This error cannot be routed back easily without knowing the original master
+                    continue
+
+                print(f"[{self.env.now}] SoCBus: Routing {response_packet.type} packet (ID: {response_packet.id}) from Slave {slave_idx} to Master {master_idx}.")
                 
                 if 0 <= master_idx < len(self.master_resp_ports):
-                    print(f"[{self.env.now}] SoCBus: Routing response from Slave {slave_idx} to Master {master_idx}: {original_response}")
-                    yield self.master_resp_ports[master_idx].put(original_response)
+                    yield self.master_resp_ports[master_idx].put(response_packet) # Pass the Packet object directly
                 else:
-                    print(f"[{self.env.now}] SoCBus Error: Invalid master index {master_idx} from Slave {slave_idx}")
+                    print(f"[{self.env.now}] SoCBus Error: Invalid master index {master_idx} from Slave {slave_idx} for packet ID {response_packet.id}.")
             else:
                 print(f"[{self.env.now}] SoCBus Error: Could not identify responding slave.")
