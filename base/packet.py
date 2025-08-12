@@ -26,6 +26,10 @@ class Packet:
         # Store any additional keyword arguments
         for key, value in kwargs.items():
             setattr(self, key, value)
+    
+    def get(self, key, default=None):
+        """Get attribute value with default"""
+        return getattr(self, key, default)
 
     def __repr__(self):
         return (f"Packet(id={self.id}, type='{self.type}', src={self.source_id}, "
