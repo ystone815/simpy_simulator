@@ -15,7 +15,8 @@ class KernelType(Enum):
 
 class CUDAKernel:
     """
-    CUDA Kernel representation with grid/block configuration and instruction generation.
+    CUDA Kernel representation with grid/block configuration, instruction generation,
+    and thread 0 storage access optimization patterns.
     """
     def __init__(self, kernel_type, grid_size, block_size, kernel_params=None):
         self.kernel_type = kernel_type
@@ -28,6 +29,11 @@ class CUDAKernel:
         self.threads_per_block = block_size[0] * block_size[1] * block_size[2]
         self.warps_per_block = (self.threads_per_block + 31) // 32
         self.total_warps = self.total_blocks * self.warps_per_block
+        
+        # Storage access optimization settings
+        self.uses_storage_access = self._kernel_uses_storage()
+        self.thread_0_leadership = True  # Enable thread 0 leadership for storage
+        self.storage_access_patterns = self._identify_storage_patterns()
         
         # Generate instruction sequence based on kernel type
         self.instructions = self._generate_instructions()
@@ -91,13 +97,17 @@ class CUDAKernel:
             WarpInstruction("HMMA", ["REG_INPUT", "REG_WV", "REG_V"], latency=1),  # V projection
         ])
         
-        # Attention scores computation
+        # Attention scores computation with KV Cache access
         for i in range(seq_len // 32):  # Process in chunks
             instructions.extend([
                 WarpInstruction("HMMA", ["REG_Q", "REG_K", "REG_SCORES"], latency=1),
                 WarpInstruction("EXP", ["REG_SCORES"], latency=4),  # Softmax exp
                 WarpInstruction("ADD", ["REG_SCORES", "REG_SUM"], latency=1),  # Sum for normalization
             ])
+            
+            # Add KV Cache access pattern (thread 0 leader)
+            if self.uses_storage_access:
+                instructions.extend(self._add_kv_cache_access_pattern())
         
         # Softmax normalization and output
         instructions.extend([
@@ -189,14 +199,17 @@ class CUDAKernel:
         # Load node features
         instructions.append(WarpInstruction("LOAD", ["GMEM_FEATURES", "REG_FEATURES"], latency=100))
         
-        # Message passing loop
+        # Message passing loop with GNN storage access
         for neighbor in range(max_neighbors):
             instructions.extend([
-                WarpInstruction("LOAD", ["GMEM_NEIGHBORS", "REG_NEIGHBOR"], latency=100),
                 WarpInstruction("BRANCH", ["neighbor_valid"], latency=1, divergent=True),
                 WarpInstruction("HMMA", ["REG_FEATURES", "REG_WEIGHT", "REG_MESSAGE"], latency=1),
                 WarpInstruction("ADD", ["REG_MESSAGE", "REG_AGGREGATION"], latency=1),
             ])
+            
+            # GNN storage access using thread 0 leadership
+            if self.uses_storage_access:
+                instructions.extend(self._add_gnn_storage_access_pattern())
         
         # Activation and update
         instructions.extend([
@@ -218,9 +231,78 @@ class CUDAKernel:
         ]
         return instructions * 10  # Repeat pattern
     
-    def get_kernel_info(self):
-        """Get kernel configuration information"""
+    def _kernel_uses_storage(self):
+        """Determine if kernel type uses storage systems"""
+        storage_kernels = [KernelType.ATTENTION, KernelType.GNN_MESSAGE_PASSING]
+        return self.kernel_type in storage_kernels
+    
+    def _identify_storage_patterns(self):
+        """Identify which storage systems this kernel uses"""
+        patterns = []
+        if self.kernel_type == KernelType.ATTENTION:
+            patterns.extend(['kv_cache', 'vector_db'])  # For RAG-style attention
+        elif self.kernel_type == KernelType.GNN_MESSAGE_PASSING:
+            patterns.append('gnn_storage')
+        return patterns
+    
+    def _add_kv_cache_access_pattern(self):
+        """Add KV Cache access instructions with thread 0 leadership"""
+        return [
+            WarpInstruction("THREAD_LEADER_CHECK", ["thread_id", "0"], latency=1),
+            WarpInstruction("BRANCH", ["is_leader"], latency=1, divergent=True),
+            WarpInstruction("STORAGE_ACCESS", ["KV_CACHE", "token_positions"], latency=5),
+            WarpInstruction("WARP_BROADCAST", ["kv_data", "all_threads"], latency=2),
+            WarpInstruction("SYNC", latency=1),
+        ]
+    
+    def _add_vector_db_access_pattern(self):
+        """Add Vector Database access instructions with thread 0 leadership"""
+        return [
+            WarpInstruction("THREAD_LEADER_CHECK", ["thread_id", "0"], latency=1),
+            WarpInstruction("BRANCH", ["is_leader"], latency=1, divergent=True),
+            WarpInstruction("STORAGE_ACCESS", ["VECTOR_DB", "query_vector"], latency=10),
+            WarpInstruction("WARP_BROADCAST", ["search_results", "all_threads"], latency=3),
+            WarpInstruction("SYNC", latency=1),
+        ]
+    
+    def _add_gnn_storage_access_pattern(self):
+        """Add GNN Storage access instructions with thread 0 leadership"""
+        return [
+            WarpInstruction("THREAD_LEADER_CHECK", ["thread_id", "0"], latency=1),
+            WarpInstruction("BRANCH", ["is_leader"], latency=1, divergent=True),
+            WarpInstruction("STORAGE_ACCESS", ["GNN_STORAGE", "neighbor_query"], latency=15),
+            WarpInstruction("LOAD", ["GMEM_NEIGHBORS", "REG_NEIGHBOR"], latency=100),
+            WarpInstruction("WARP_BROADCAST", ["neighbor_data", "all_threads"], latency=4),
+            WarpInstruction("SYNC", latency=1),
+        ]
+    
+    def get_storage_optimization_stats(self):
+        """Get statistics about storage access optimizations"""
+        if not self.uses_storage_access:
+            return {'uses_storage': False}
+        
+        # Estimate savings from thread 0 leadership
+        total_threads = self.total_warps * 32
+        threads_per_warp = 32
+        storage_instructions = len([i for i in self.instructions if 'STORAGE_ACCESS' in i.opcode])
+        
+        # Thread 0 leadership saves (31/32) of storage accesses per warp
+        bandwidth_savings = (threads_per_warp - 1) / threads_per_warp * storage_instructions
+        latency_reduction = storage_instructions * 0.3  # 30% latency reduction
+        
         return {
+            'uses_storage': True,
+            'storage_patterns': self.storage_access_patterns,
+            'thread_0_leadership': self.thread_0_leadership,
+            'total_warps': self.total_warps,
+            'storage_instructions': storage_instructions,
+            'estimated_bandwidth_savings': bandwidth_savings,
+            'estimated_latency_reduction': latency_reduction
+        }
+    
+    def get_kernel_info(self):
+        """Get kernel configuration information including storage optimizations"""
+        base_info = {
             'kernel_type': self.kernel_type.value,
             'grid_size': self.grid_size,
             'block_size': self.block_size,
@@ -231,6 +313,12 @@ class CUDAKernel:
             'instruction_count': len(self.instructions),
             'kernel_params': self.kernel_params
         }
+        
+        # Add storage optimization info
+        storage_info = self.get_storage_optimization_stats()
+        base_info.update(storage_info)
+        
+        return base_info
 
 
 class WorkloadGenerator:

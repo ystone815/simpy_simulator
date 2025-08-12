@@ -73,22 +73,29 @@ class KVCacheStorage:
             yield self.env.process(self.handle_kv_request(request))
     
     def handle_kv_request(self, packet):
-        """Handle KV cache access request"""
+        """Handle KV cache access request with thread 0 leadership optimization"""
         request_type = packet.type  # 'store', 'retrieve', 'evict'
         layer_id = packet.get('layer_id', 0)
         token_positions = packet.get('token_positions', [])
         attention_scores = packet.get('attention_scores', [])
+        warp_context = packet.get('warp_context', None)
         
         self.total_accesses += 1
         
+        # Check if this is a thread 0 leader request
+        is_thread_leader = packet.get('thread_leader', False)
+        thread_broadcast = packet.get('broadcast_to_warp', True)
+        
         if request_type == 'store':
-            yield self.env.process(self._store_kv_tokens(
-                layer_id, token_positions, packet.data, attention_scores
+            result = yield self.env.process(self._store_kv_tokens(
+                layer_id, token_positions, packet.data, attention_scores, 
+                warp_context, is_thread_leader
             ))
         
         elif request_type == 'retrieve':
             result = yield self.env.process(self._retrieve_kv_tokens(
-                layer_id, token_positions, packet.get('access_pattern', KVCacheAccessPattern.SEQUENTIAL)
+                layer_id, token_positions, packet.get('access_pattern', KVCacheAccessPattern.SEQUENTIAL),
+                warp_context, is_thread_leader, thread_broadcast
             ))
             
             # Send response
@@ -107,10 +114,18 @@ class KVCacheStorage:
         elif request_type == 'adaptive_evict':
             yield self.env.process(self._adaptive_eviction(layer_id))
     
-    def _store_kv_tokens(self, layer_id, token_positions, kv_data, attention_scores):
-        """Store KV pairs for tokens with importance-based compression"""
+    def _store_kv_tokens(self, layer_id, token_positions, kv_data, attention_scores, warp_context=None, is_thread_leader=False):
+        """Store KV pairs for tokens with importance-based compression and thread 0 optimization"""
         base_latency = 1  # Base storage latency
         compression_latency = 0
+        thread_optimization_savings = 0
+        
+        # Thread 0 leadership optimization for storage
+        if warp_context and is_thread_leader:
+            # Only thread 0 performs actual storage operations
+            # Reduce redundant memory transactions from other threads
+            thread_optimization_savings = len(token_positions) * 0.1  # 10% per token savings
+            base_latency = max(0.5, base_latency - thread_optimization_savings)
         
         for i, token_pos in enumerate(token_positions):
             token_key = (layer_id, token_pos)
@@ -155,12 +170,23 @@ class KVCacheStorage:
         total_latency = base_latency + compression_latency
         yield self.env.timeout(total_latency)
     
-    def _retrieve_kv_tokens(self, layer_id, token_positions, access_pattern):
-        """Retrieve KV pairs with pattern-aware optimization"""
+    def _retrieve_kv_tokens(self, layer_id, token_positions, access_pattern, warp_context=None, is_thread_leader=False, thread_broadcast=True):
+        """Retrieve KV pairs with pattern-aware optimization and thread 0 leadership"""
         base_latency = 1
         decompression_latency = 0
         cache_hits = 0
         retrieved_data = []
+        broadcast_latency = 0
+        
+        # Thread 0 leadership optimization
+        if warp_context and is_thread_leader:
+            # Thread 0 performs storage access, then broadcasts to warp
+            base_latency *= 0.7  # 30% reduction for consolidated access
+            
+            if thread_broadcast:
+                # Add broadcast overhead (shuffle operations)
+                warp_size = getattr(warp_context, 'num_threads', 32)
+                broadcast_latency = max(1, int(warp_size / 4))  # 4 threads per shuffle cycle
         
         # Optimize access based on pattern
         if access_pattern == KVCacheAccessPattern.ATTENTION_PATTERN:
@@ -200,16 +226,20 @@ class KVCacheStorage:
                 # Would need to fetch from slower storage
                 retrieved_data.append(None)
         
-        total_latency = base_latency + decompression_latency
+        total_latency = base_latency + decompression_latency + broadcast_latency
         yield self.env.timeout(total_latency)
         
-        return {
+        result = {
             'data': retrieved_data,
             'hit': cache_hits == len(token_positions),
             'hit_ratio': cache_hits / len(token_positions),
             'compressed': decompression_latency > 0,
-            'latency': total_latency
+            'latency': total_latency,
+            'thread_leader_access': is_thread_leader,
+            'broadcast_latency': broadcast_latency
         }
+        
+        return result
     
     def _calculate_token_importance(self, token_pos, attention_score):
         """Calculate token importance for retention decisions"""
@@ -374,19 +404,22 @@ class VectorDatabase:
             yield self.env.process(self.handle_vector_request(request))
     
     def handle_vector_request(self, packet):
-        """Handle vector database request"""
+        """Handle vector database request with thread 0 leadership optimization"""
         request_type = packet.type  # 'insert', 'search', 'build_index', 'update_tier'
+        warp_context = packet.get('warp_context', None)
+        is_thread_leader = packet.get('thread_leader', False)
         
         if request_type == 'insert':
             result = yield self.env.process(self._insert_vectors(
-                packet.data, packet.get('metadata_list', [])
+                packet.data, packet.get('metadata_list', []), warp_context, is_thread_leader
             ))
         
         elif request_type == 'search':
             result = yield self.env.process(self._search_similar_vectors(
                 packet.data,  # Query vector
                 packet.get('k', 10),  # Number of neighbors
-                packet.get('search_params', {})
+                packet.get('search_params', {}),
+                warp_context, is_thread_leader
             ))
         
         elif request_type == 'build_index':
@@ -408,10 +441,17 @@ class VectorDatabase:
         )
         yield self.response_port.put(response)
     
-    def _insert_vectors(self, vectors, metadata_list):
-        """Insert new vectors into the database"""
+    def _insert_vectors(self, vectors, metadata_list, warp_context=None, is_thread_leader=False):
+        """Insert new vectors into the database with thread 0 leadership"""
         insertion_latency = 0
         inserted_count = 0
+        
+        # Thread 0 leadership optimization for batch insertion
+        if warp_context and is_thread_leader:
+            # Thread 0 handles batch insertion, reducing memory contention
+            insertion_latency_multiplier = 0.6  # 40% reduction
+        else:
+            insertion_latency_multiplier = 1.0
         
         for i, vector in enumerate(vectors):
             if len(self.vectors) >= self.max_vectors:
@@ -428,7 +468,7 @@ class VectorDatabase:
             self.hot_vectors.add(vector_id)
             
             inserted_count += 1
-            insertion_latency += 0.1  # Per-vector insertion cost
+            insertion_latency += 0.1 * insertion_latency_multiplier  # Per-vector insertion cost
         
         # Invalidate index if significant insertion
         if inserted_count > len(self.vectors) * 0.1:
@@ -443,10 +483,20 @@ class VectorDatabase:
             'latency': insertion_latency
         }
     
-    def _search_similar_vectors(self, query_vector, k, search_params):
-        """Search for k most similar vectors"""
+    def _search_similar_vectors(self, query_vector, k, search_params, warp_context=None, is_thread_leader=False):
+        """Search for k most similar vectors with thread 0 leadership"""
         self.total_queries += 1
         search_latency = 0
+        broadcast_latency = 0
+        
+        # Thread 0 leadership optimization
+        if warp_context and is_thread_leader:
+            # Thread 0 performs search, broadcasts results
+            search_efficiency = 0.8  # 20% improvement
+            warp_size = getattr(warp_context, 'num_threads', 32)
+            broadcast_latency = max(1, int(warp_size / 8))  # Broadcast search results
+        else:
+            search_efficiency = 1.0
         
         if not self.vectors:
             return {'results': [], 'latency': 0, 'method': 'empty'}
@@ -455,11 +505,12 @@ class VectorDatabase:
             # Use index-based search
             search_latency = self.index_params[self.index_type]["search_time_base"]
             search_latency *= math.log(len(self.vectors)) / math.log(2)  # Log complexity
+            search_latency *= search_efficiency  # Apply thread 0 optimization
             self.index_hits += 1
             search_method = f"index_{self.index_type.value}"
         else:
             # Fallback to exact search
-            search_latency = len(self.vectors) * 0.001  # Linear scan
+            search_latency = len(self.vectors) * 0.001 * search_efficiency  # Linear scan
             self.exact_searches += 1
             search_method = "exact_search"
         
@@ -471,7 +522,8 @@ class VectorDatabase:
         if cold_vectors_accessed > 0:
             search_latency += cold_vectors_accessed * 0.01
         
-        yield self.env.timeout(search_latency)
+        total_search_latency = search_latency + broadcast_latency
+        yield self.env.timeout(total_search_latency)
         
         # Simulate finding k nearest neighbors
         # In practice, this would involve actual distance calculations
@@ -486,10 +538,12 @@ class VectorDatabase:
         return {
             'results': results,
             'distances': [random.uniform(0, 1) for _ in results],  # Simulated distances
-            'latency': search_latency,
+            'latency': total_search_latency,
             'method': search_method,
             'hot_vectors_accessed': hot_vectors_accessed,
-            'cold_vectors_accessed': cold_vectors_accessed
+            'cold_vectors_accessed': cold_vectors_accessed,
+            'thread_leader_access': is_thread_leader,
+            'broadcast_latency': broadcast_latency
         }
     
     def _build_index(self):
@@ -631,19 +685,23 @@ class GNNStorage:
             yield self.env.process(self.handle_gnn_request(request))
     
     def handle_gnn_request(self, packet):
-        """Handle GNN storage request"""
+        """Handle GNN storage request with thread 0 leadership optimization"""
         request_type = packet.type
+        warp_context = packet.get('warp_context', None)
+        is_thread_leader = packet.get('thread_leader', False)
         
         if request_type == 'add_nodes':
             result = yield self.env.process(self._add_nodes(
                 packet.data.get('node_ids', []),
-                packet.data.get('features', [])
+                packet.data.get('features', []),
+                warp_context, is_thread_leader
             ))
         
         elif request_type == 'add_edges':
             result = yield self.env.process(self._add_edges(
                 packet.data.get('edges', []),  # [(src, dst), ...]
-                packet.data.get('edge_features', [])
+                packet.data.get('edge_features', []),
+                warp_context, is_thread_leader
             ))
         
         elif request_type == 'sample_neighborhood':
@@ -651,7 +709,8 @@ class GNNStorage:
                 packet.data.get('node_id'),
                 packet.data.get('num_hops', 2),
                 packet.data.get('num_neighbors', 10),
-                packet.data.get('access_pattern', GraphAccessPattern.UNIFORM)
+                packet.data.get('access_pattern', GraphAccessPattern.UNIFORM),
+                warp_context, is_thread_leader
             ))
         
         elif request_type == 'batch_sample':
@@ -673,10 +732,17 @@ class GNNStorage:
         )
         yield self.response_port.put(response)
     
-    def _add_nodes(self, node_ids, features):
-        """Add nodes with features to the graph"""
+    def _add_nodes(self, node_ids, features, warp_context=None, is_thread_leader=False):
+        """Add nodes with features to the graph using thread 0 leadership"""
         nodes_added = 0
         addition_latency = 0
+        
+        # Thread 0 leadership for graph modifications
+        if warp_context and is_thread_leader:
+            # Thread 0 handles batch node additions
+            latency_multiplier = 0.5  # 50% improvement for batch operations
+        else:
+            latency_multiplier = 1.0
         
         for i, node_id in enumerate(node_ids):
             if self.node_count >= self.max_nodes:
@@ -688,7 +754,7 @@ class GNNStorage:
                 self.node_features[node_id] = feature
                 nodes_added += 1
                 self.node_count += 1
-                addition_latency += 0.01  # Per-node addition cost
+                addition_latency += 0.01 * latency_multiplier  # Per-node addition cost
         
         yield self.env.timeout(addition_latency)
         
@@ -698,10 +764,16 @@ class GNNStorage:
             'latency': addition_latency
         }
     
-    def _add_edges(self, edges, edge_features):
-        """Add edges to the graph structure"""
+    def _add_edges(self, edges, edge_features, warp_context=None, is_thread_leader=False):
+        """Add edges to the graph structure using thread 0 leadership"""
         edges_added = 0
         addition_latency = 0
+        
+        # Thread 0 leadership for edge operations
+        if warp_context and is_thread_leader:
+            latency_multiplier = 0.6  # 40% improvement for batch edge operations
+        else:
+            latency_multiplier = 1.0
         
         for i, (src, dst) in enumerate(edges):
             if self.edge_count >= self.max_edges:
@@ -721,7 +793,7 @@ class GNNStorage:
                 if src in self.neighborhood_cache:
                     del self.neighborhood_cache[src]
                 
-                addition_latency += 0.005  # Per-edge addition cost
+                addition_latency += 0.005 * latency_multiplier  # Per-edge addition cost
         
         yield self.env.timeout(addition_latency)
         
@@ -731,13 +803,23 @@ class GNNStorage:
             'latency': addition_latency
         }
     
-    def _sample_neighborhood(self, center_node, num_hops, num_neighbors, access_pattern):
-        """Sample neighborhood around a center node"""
+    def _sample_neighborhood(self, center_node, num_hops, num_neighbors, access_pattern, warp_context=None, is_thread_leader=False):
+        """Sample neighborhood around a center node with thread 0 leadership"""
         if center_node not in self.node_features:
             return {'error': 'Node not found', 'node_id': center_node}
         
         self.neighborhood_queries += 1
         self.node_access_frequency[center_node] += 1
+        
+        # Thread 0 leadership for neighborhood sampling
+        broadcast_latency = 0
+        if warp_context and is_thread_leader:
+            # Thread 0 performs sampling, broadcasts to other threads
+            sampling_efficiency = 0.7  # 30% improvement
+            warp_size = getattr(warp_context, 'num_threads', 32)
+            broadcast_latency = max(1, int(warp_size / 8))  # Broadcast sampled data
+        else:
+            sampling_efficiency = 1.0
         
         # Check cache first
         cache_key = (center_node, num_hops, num_neighbors)
@@ -777,7 +859,7 @@ class GNNStorage:
                         next_frontier.append(neighbor)
                         self.node_access_frequency[neighbor] += 1
                 
-                sampling_latency += len(neighbors) * 0.001  # Neighbor access cost
+                sampling_latency += len(neighbors) * 0.001 * sampling_efficiency  # Neighbor access cost
             
             current_frontier = next_frontier
             if not current_frontier:
@@ -794,6 +876,8 @@ class GNNStorage:
                 if dst in visited_nodes:
                     sampled_edges.append((src, dst))
         
+        total_sampling_latency = sampling_latency + broadcast_latency
+        
         result = {
             'center_node': center_node,
             'sampled_nodes': sampled_nodes,
@@ -801,14 +885,16 @@ class GNNStorage:
             'node_features': node_features,
             'num_nodes': len(sampled_nodes),
             'num_edges': len(sampled_edges),
-            'latency': sampling_latency,
-            'access_pattern': access_pattern.value
+            'latency': total_sampling_latency,
+            'access_pattern': access_pattern.value,
+            'thread_leader_access': is_thread_leader,
+            'broadcast_latency': broadcast_latency
         }
         
         # Cache the result
         self.neighborhood_cache[cache_key] = result
         
-        yield self.env.timeout(sampling_latency)
+        yield self.env.timeout(total_sampling_latency)
         return result
     
     def _batch_sample_subgraphs(self, seed_nodes, batch_size):

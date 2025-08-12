@@ -53,6 +53,13 @@ class Warp:
         self.barrier_count = 0
         self.sync_mask = 0
         
+        # Storage access optimization
+        self.storage_access_stats = {
+            'thread_0_accesses': 0,
+            'broadcast_operations': 0,
+            'bandwidth_saved': 0
+        }
+        
     def add_instruction(self, instruction):
         """Add instruction to warp's execution queue"""
         self.instruction_queue.append(instruction)
@@ -216,6 +223,43 @@ class Warp:
         active_count = len(self.thread_context.get_active_threads())
         return active_count / self.num_threads
     
+    def get_warp_leader(self):
+        """Get the warp leader (thread 0) if active"""
+        if self.thread_context.threads and self.thread_context.threads[0].is_active():
+            return self.thread_context.threads[0]
+        return None
+    
+    def execute_storage_access(self, storage_request, broadcast_to_all=True):
+        """Execute storage access using thread 0 as leader with broadcast"""
+        leader = self.get_warp_leader()
+        if not leader:
+            return None
+        
+        # Only thread 0 performs the actual storage access
+        self.storage_access_stats['thread_0_accesses'] += 1
+        
+        # Simulate storage access latency for leader
+        access_cycles = storage_request.get('latency', 10)
+        
+        if broadcast_to_all:
+            # Broadcast result to all active threads using shuffle
+            active_threads = self.thread_context.get_active_threads()
+            self.storage_access_stats['broadcast_operations'] += 1
+            self.storage_access_stats['bandwidth_saved'] += (len(active_threads) - 1) * storage_request.get('size', 1)
+            
+            # Simulate broadcast latency (1 cycle per shuffle operation)
+            broadcast_cycles = 1
+            total_cycles = access_cycles + broadcast_cycles
+        else:
+            total_cycles = access_cycles
+        
+        return {
+            'success': True,
+            'cycles': total_cycles,
+            'leader_thread': leader.thread_id,
+            'threads_served': len(self.thread_context.get_active_threads()) if broadcast_to_all else 1
+        }
+    
     def get_performance_stats(self):
         """Get performance statistics for this warp"""
         ipc = self.instructions_executed / max(self.cycles_executed, 1)
@@ -229,7 +273,8 @@ class Warp:
             'stall_cycles': self.stall_cycles,
             'stall_ratio': stall_ratio,
             'divergence_events': self.divergence_events,
-            'utilization': self.get_utilization()
+            'utilization': self.get_utilization(),
+            'storage_access_stats': self.storage_access_stats
         }
     
     def __repr__(self):

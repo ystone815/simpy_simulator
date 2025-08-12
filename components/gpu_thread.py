@@ -156,3 +156,14 @@ class RegisterAllocator:
         """Check if registers can be allocated"""
         available = self.total_registers - sum(self.allocated_registers.values())
         return num_registers <= available
+    
+    def account_storage_optimization(self, threads_saved, registers_per_thread=32):
+        """Account for register savings from thread 0 storage access pattern"""
+        # When only thread 0 accesses storage, other threads don't need storage-related registers
+        self.storage_register_savings += (threads_saved - 1) * registers_per_thread
+        return self.storage_register_savings
+    
+    def get_optimized_register_pressure(self):
+        """Get register pressure accounting for storage access optimizations"""
+        effective_usage = sum(self.allocated_registers.values()) - self.storage_register_savings
+        return effective_usage / self.total_registers
