@@ -1,0 +1,100 @@
+# Default SimPy GPU Simulator Configuration
+
+simulation:
+  simulation_time: 50000
+  random_seed: 42
+  log_level: "INFO"
+  enable_tracing: false
+  enable_metrics: true
+
+system:
+  memory_size_gb: 32
+  cpu_cores: 8
+  nvme_sqs: 1024
+  enable_doorbell_optimization: true
+  cache_sizes:
+    l1_cache_kb: 128
+    l2_cache_mb: 40
+    shared_memory_kb: 164
+
+gpu:
+  name: "H100"
+  num_sms: 144
+  threads_per_warp: 32
+  warps_per_sm: 64
+  max_threads_per_sm: 2048
+  memory_bandwidth_gbps: 2000.0
+  memory_size_gb: 80
+  tensor_cores: true
+  tensor_precision: ["FP32", "FP16", "BF16", "FP8"]
+  transformer_engine: true
+
+gnn:
+  execution_mode: "adaptive_hybrid"
+  graph_format: "hybrid_adaptive"
+  access_pattern:
+    pattern: "hybrid_degree_based"
+    degree_threshold: 32
+    enable_thread0_optimization: true
+    enable_warp_shuffle: true
+    sq_lock_optimization: true
+    sparse_threshold: 0.005
+    dense_threshold: 0.02
+    hub_ratio_threshold: 0.1
+  
+  graph:
+    num_nodes: 1000
+    num_edges: 5000
+    graph_type: "random"
+    average_degree: 10.0
+    degree_distribution: "uniform"
+    hub_threshold: 32
+    sparsity_ratio: 0.01
+  
+  num_layers: 3
+  hidden_dimensions: [256, 128, 64]
+  message_size_bytes: 256
+  batch_size: 1
+  num_warps: 8
+  enable_memory_coalescing: true
+
+storage:
+  kv_cache_size_gb: 8.0
+  vector_db_dimension: 512
+  graph_storage_format: "adjacency_list"
+  compression_enabled: true
+  cache_policy: "lru"
+  broadcast_latency_cycles: 2
+  storage_access_latency_cycles: 64
+  bandwidth_reduction_factor: 0.969
+
+benchmark:
+  name: "gpu_simulation_benchmark"
+  version: "1.0"
+  description: "Comprehensive GPU simulation benchmarking"
+  
+  run_unit_tests: true
+  run_integration_tests: true
+  run_performance_tests: true
+  
+  workload_sizes: [5, 10, 20, 40]
+  sq_counts: [32, 64, 128, 256, 512, 1024]
+  graph_types: ["sparse_uniform", "dense_uniform", "power_law_hubs", "random_mixed"]
+  access_patterns: ["thread_0_leader", "multi_thread_parallel", "edge_centric_cugraph", "hybrid_degree_based"]
+  
+  save_results: true
+  results_directory: "results"
+  generate_plots: false
+  verbose_output: true
+  
+  max_memory_gb: 16
+  max_cpu_cores: 8
+  parallel_tests: false
+
+metrics:
+  collect_latency: true
+  collect_throughput: true
+  collect_storage_efficiency: true
+  collect_sq_contention: true
+  output_format: "json"
+  save_detailed_logs: false

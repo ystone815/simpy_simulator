@@ -1,0 +1,22 @@
+benchmark:
+  access_patterns:
+  - thread_0_leader
+  - multi_thread_parallel
+  - edge_centric_cugraph
+  - hybrid_degree_based
+  name: gnn_benchmark
+  results_directory: results/gnn_benchmarks
+  run_performance_tests: true
+  save_results: true
+  workload_sizes:
+  - 5
+  - 10
+  - 20
+  - 40
+gnn:
+  execution_mode: adaptive_hybrid
+  num_layers: 3
+  num_warps: 8
+simulation:
+  random_seed: 42
+  simulation_time: 50000

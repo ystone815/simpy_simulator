@@ -1,0 +1,44 @@
+# B200 vs H100 comparison benchmark configuration
+
+simulation:
+  simulation_time: 50000
+  random_seed: 42
+
+# B200 specific configuration
+gpu:
+  name: "B200"
+  num_sms: 144
+  chiplets: 2
+  sms_per_chiplet: 72
+  memory_bandwidth_gbps: 8000.0
+  memory_size_gb: 192
+  tensor_precision: ["FP32", "FP16", "BF16", "FP8", "FP4"]
+  shader_execution_reordering: true
+  sparsity_support: true
+
+gnn:
+  execution_mode: "adaptive_hybrid"
+  num_layers: 5
+  hidden_dimensions: [512, 256, 128, 64, 32]
+
+benchmark:
+  name: "b200_vs_h100_comparison"
+  description: "Performance comparison between B200 and H100 architectures"
+  
+  # Comparison settings
+  gpu_architectures: ["H100", "B200"]
+  optimization_levels: ["none", "thread_0", "hybrid"]
+  baseline_config: "H100_thread_0"
+  
+  # Statistical analysis
+  num_runs_per_config: 5
+  confidence_interval: 0.95
+  statistical_significance_threshold: 0.05
+  
+  # Large-scale workloads for architecture comparison
+  workload_sizes: [10, 20, 40, 80]
+  node_counts: [640, 1280, 2560, 5120]
+  
+  save_results: true
+  results_directory: "results/architecture_comparison"
+  generate_plots: true
